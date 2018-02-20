@@ -28,6 +28,7 @@ public class FetchAndLockProvider implements ContextResolver<FetchAndLockHandler
 
   public FetchAndLockProvider() {
     fetchAndLockHandler = new FetchAndLockHandler();
+    fetchAndLockHandler.start();
   }
 
   @Override

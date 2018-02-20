@@ -12,27 +12,24 @@
  */
 package org.camunda.bpm.engine.rest.impl.fetchAndLock;
 
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import javax.ws.rs.container.AsyncResponse;
+import javax.ws.rs.core.HttpHeaders;
+import javax.ws.rs.core.Response.Status;
+
+import org.camunda.bpm.engine.IdentityService;
 import org.camunda.bpm.engine.ProcessEngine;
 import org.camunda.bpm.engine.ProcessEngineException;
 import org.camunda.bpm.engine.externaltask.ExternalTaskQueryBuilder;
 import org.camunda.bpm.engine.externaltask.ExternalTaskQueryTopicBuilder;
 import org.camunda.bpm.engine.externaltask.LockedExternalTask;
-import org.camunda.bpm.engine.identity.Group;
-import org.camunda.bpm.engine.identity.Tenant;
-import org.camunda.bpm.engine.impl.digest._apacheCommonsCodec.Base64;
+import org.camunda.bpm.engine.impl.identity.Authentication;
 import org.camunda.bpm.engine.impl.util.ClockUtil;
 import org.camunda.bpm.engine.rest.dto.externaltask.LockedExternalTaskDto;
 import org.camunda.bpm.engine.rest.exception.InvalidRequestException;
-import org.camunda.bpm.engine.rest.security.auth.AuthenticationResult;
-
-import javax.ws.rs.NotAuthorizedException;
-import javax.ws.rs.container.AsyncResponse;
-import javax.ws.rs.core.HttpHeaders;
-import javax.ws.rs.core.Response.Status;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * @author Tassilo Weidner
@@ -40,22 +37,19 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public class FetchAndLockHandler implements Runnable {
 
   private static final long MAX_BACK_OFF_TIME = Long.MAX_VALUE;
-  private static final long MIN_BACK_OFF_TIME = 3000; // 3 seconds
-  private static final long DEFAULT_BACK_OFF_TIME = 15000; // 15 seconds
-  public static final long MIN_TIMEOUT = 60000; // 1 minute
   public static final long MAX_TIMEOUT = 1800000; // 30 minutes
-  public static final String BASIC_AUTH_HEADER_PREFIX = "Basic ";
 
   private List<FetchAndLockRequest> pendingRequests = new CopyOnWriteArrayList<FetchAndLockRequest>();
+
+  private AtomicBoolean isWaiting = new AtomicBoolean(false);
+  private Object MONITOR = new Object();
   private Thread handlerThread = new Thread(this, this.getClass().getSimpleName());
-  private boolean isRunning = true;
+  private boolean isRunning = false;
 
   public FetchAndLockHandler() {
-    handlerThread.start();
-
     // shutdown thread gracefully
     Runtime.getRuntime()
-      .addShutdownHook( new Thread() {
+      .addShutdownHook(new Thread() {
         @Override
         public void run(){
           shutdown();
@@ -66,95 +60,119 @@ public class FetchAndLockHandler implements Runnable {
   @Override
   public void run() {
     while (isRunning) {
-      long backOffTime;
-      if (pendingRequests.isEmpty()) {
-        backOffTime = MAX_BACK_OFF_TIME;
-      } else {
-        for (FetchAndLockRequest pendingRequest : pendingRequests) {
-          List<LockedExternalTaskDto> lockedTasks = tryFetchAndLock(pendingRequest);
-          if (lockedTasks != null) { // if false not authorized; pending request has already been removed
-            FetchExternalTasksExtendedDto dto = pendingRequest.getDto();
-            long asyncResponseTimeout = dto.getAsyncResponseTimeout();
-            long currentTime = ClockUtil.getCurrentTime().getTime();
-            long requestTime = pendingRequest.getRequestTime().getTime();
-            if (!lockedTasks.isEmpty() || (requestTime + asyncResponseTimeout) <= currentTime) {
-              pendingRequests.remove(pendingRequest);
-              AsyncResponse asyncResponse = pendingRequest.getAsyncResponse();
-              asyncResponse.resume(lockedTasks);
-            }
-          }
-        }
 
-        if (!pendingRequests.isEmpty()) {
-          FetchAndLockRequest pendingRequest = pendingRequests.get(0); // get pending request with minimum slack time
+      long backoffTime = MAX_BACK_OFF_TIME;
+      long start = ClockUtil.getCurrentTime().getTime();
+
+      for (FetchAndLockRequest pendingRequest : pendingRequests) {
+
+        FetchAndLockResult result = tryFetchAndLock(pendingRequest);
+
+        if (result.wasSuccessful()) {
+
+          List<LockedExternalTaskDto> lockedTasks = result.tasks;
+
           FetchExternalTasksExtendedDto dto = pendingRequest.getDto();
+          long requestTime = pendingRequest.getRequestTime().getTime();
           long asyncResponseTimeout = dto.getAsyncResponseTimeout();
           long currentTime = ClockUtil.getCurrentTime().getTime();
-          long requestTime = pendingRequest.getRequestTime().getTime();
-          long slackTime = requestTime - currentTime + asyncResponseTimeout;
-          long dividedSlackTime = slackTime / 10;
-          if (dividedSlackTime > 0) {
-            if (dividedSlackTime > DEFAULT_BACK_OFF_TIME) {
-              backOffTime = dividedSlackTime;
-            } else {
-              backOffTime = DEFAULT_BACK_OFF_TIME;
-            }
-          } else {
-            backOffTime = MIN_BACK_OFF_TIME;
+
+          long timeout = requestTime + asyncResponseTimeout;
+
+          if (!lockedTasks.isEmpty() || timeout <= currentTime) {
+            AsyncResponse asyncResponse = pendingRequest.getAsyncResponse();
+            pendingRequests.remove(pendingRequest);
+            asyncResponse.resume(lockedTasks);
           }
-        } else {
-          backOffTime = MAX_BACK_OFF_TIME;
+          else {
+            long slackTime = timeout - currentTime;
+            if (slackTime < backoffTime) {
+              backoffTime = slackTime;
+            }
+          }
+        }
+        else {
+          handleProcessEngineException(pendingRequest, result.processEngineException);
         }
       }
 
-      try {
-        Thread.sleep(backOffTime);
-      } catch (InterruptedException ignored) { }
+      backoffTime = Math.max(0, (start + backoffTime) - System.currentTimeMillis());
+      suspend(backoffTime);
+    }
+
+    for (FetchAndLockRequest pendingRequest: pendingRequests) {
+      invalidRequest(pendingRequest.getAsyncResponse(), "Request rejected due to shutdown of application server.");
     }
   }
 
-  private AuthenticationResult checkAuthentication(FetchAndLockRequest request) {
-    AuthenticationResult authenticationResult =
-      extractAuthenticatedUser(request.getProcessEngine(), request.getAuthHeader());
-    if (!authenticationResult.isAuthenticated()) {
-      AsyncResponse asyncResponse = request.getAsyncResponse();
-      NotAuthorizedException notAuthorizedException = new NotAuthorizedException(BASIC_AUTH_HEADER_PREFIX +
-        "realm=\"" + request.getProcessEngine().getName() + "\"");
-      asyncResponse.resume(notAuthorizedException);
-      pendingRequests.remove(request);
+  public void start() {
+    if (isRunning) {
+      return;
     }
 
-    return authenticationResult;
+    handlerThread.start();
+    isRunning = true;
   }
 
-  private List<LockedExternalTaskDto> tryFetchAndLock(FetchAndLockRequest request) {
-    AuthenticationResult authenticationResult = null;
-    try {
-      authenticationResult = checkAuthentication(request);
-    } catch (ProcessEngineException e) {
-      handleProcessEngineException(request, e);
-    }
-
-    if (authenticationResult != null && authenticationResult.isAuthenticated()) {
-      List<LockedExternalTaskDto> lockedTasks = Collections.emptyList();
-
-      try {
-        setAuthenticatedUser(request.getProcessEngine(), authenticationResult.getAuthenticatedUser());
-        lockedTasks = delegateFetchAndLock(request);
-        clearAuthentication(request.getProcessEngine());
-      } catch (ProcessEngineException e) {
-        handleProcessEngineException(request, e);
+  public void shutdown() {
+    synchronized (MONITOR) {
+      isRunning = false;
+      if(isWaiting.compareAndSet(true, false)) {
+        MONITOR.notifyAll();
       }
-
-      return lockedTasks;
     }
-
-    return null; // not authorized
   }
 
-  private List<LockedExternalTaskDto> delegateFetchAndLock(FetchAndLockRequest request) {
-    FetchExternalTasksExtendedDto fetchingDto = request.getDto();
-    ExternalTaskQueryBuilder fetchBuilder = request.getProcessEngine()
+  private void suspend(long millis) {
+    if (millis <= 0) {
+      return;
+    }
+
+    try {
+      synchronized (MONITOR) {
+        isWaiting.set(true);
+        MONITOR.wait(millis);
+      }
+    }
+    catch (InterruptedException ignore) {}
+    finally {
+      isWaiting.set(false);
+    }
+  }
+
+  private void addRequest(FetchAndLockRequest request) {
+    pendingRequests.add(request);
+    if (isWaiting.compareAndSet(true, false)) {
+      synchronized (MONITOR) {
+        MONITOR.notifyAll();
+      }
+    }
+  }
+
+  private FetchAndLockResult tryFetchAndLock(FetchAndLockRequest request) {
+    ProcessEngine processEngine = request.getProcessEngine();
+    IdentityService identityService = processEngine.getIdentityService();
+
+    FetchAndLockResult result = null;
+
+    try {
+      identityService.setAuthentication(request.getAuthentication());
+      FetchExternalTasksExtendedDto fetchingDto = request.getDto();
+      List<LockedExternalTaskDto> lockedTasks = executeFetchAndLock(fetchingDto, processEngine);
+      result = FetchAndLockResult.successful(lockedTasks);
+    }
+    catch (ProcessEngineException e) {
+      result = FetchAndLockResult.failed(e);
+    }
+    finally {
+      identityService.clearAuthentication();
+    }
+
+    return result;
+  }
+
+  private List<LockedExternalTaskDto> executeFetchAndLock(FetchExternalTasksExtendedDto fetchingDto, ProcessEngine processEngine) {
+    ExternalTaskQueryBuilder fetchBuilder = processEngine
       .getExternalTaskService()
       .fetchAndLock(fetchingDto.getMaxTasks(), fetchingDto.getWorkerId(), fetchingDto.isUsePriority());
 
@@ -175,8 +193,8 @@ public class FetchAndLockHandler implements Runnable {
       }
     }
 
-    List<LockedExternalTask> tasks = fetchBuilder.execute();
-    return LockedExternalTaskDto.fromLockedExternalTasks(tasks);
+    List<LockedExternalTask> externalTasks = fetchBuilder.execute();
+    return LockedExternalTaskDto.fromLockedExternalTasks(externalTasks);
   }
 
   private void invalidRequest(AsyncResponse asyncResponse, String message) {
@@ -185,135 +203,87 @@ public class FetchAndLockHandler implements Runnable {
   }
 
   private void handleProcessEngineException(FetchAndLockRequest request, ProcessEngineException exception) {
-    pendingRequests.remove(request);
     AsyncResponse asyncResponse = request.getAsyncResponse();
-    asyncResponse.resume(new InvalidRequestException(Status.BAD_REQUEST, exception, exception.getMessage()));
+    pendingRequests.remove(request);
+    asyncResponse.resume(exception);
   }
 
   public void addPendingRequest(FetchExternalTasksExtendedDto dto,
                          AsyncResponse asyncResponse, HttpHeaders headers, ProcessEngine processEngine) {
 
     Long asyncResponseTimeout = dto.getAsyncResponseTimeout();
-    if (asyncResponseTimeout != null && asyncResponseTimeout < MIN_TIMEOUT) {
-      invalidRequest(asyncResponse, "The asynchronous response timeout cannot be set to a value less than "
-        + MIN_TIMEOUT + " milliseconds");
-      return;
-    }
-
     if (asyncResponseTimeout != null && asyncResponseTimeout > MAX_TIMEOUT) {
       invalidRequest(asyncResponse, "The asynchronous response timeout cannot be set to a value greater than "
         + MAX_TIMEOUT + " milliseconds");
       return;
     }
 
+    IdentityService identityService = processEngine.getIdentityService();
+    Authentication authentication = identityService.getCurrentAuthentication();
+
     FetchAndLockRequest incomingRequest = new FetchAndLockRequest()
       .setProcessEngine(processEngine)
       .setAsyncResponse(asyncResponse)
+      .setAuthentication(authentication)
       .setDto(dto);
 
-    String authHeader = headers.getHeaderString(HttpHeaders.AUTHORIZATION);
-    if (authHeader != null && !authHeader.isEmpty()) {
-      incomingRequest.setAuthHeader(authHeader);
-    }
+    FetchAndLockResult result = tryFetchAndLock(incomingRequest);
 
-    List<LockedExternalTaskDto> lockedTasks = tryFetchAndLock(incomingRequest);
-    if (lockedTasks != null) {
-      if (dto.getAsyncResponseTimeout() == null || !lockedTasks.isEmpty()) { // response immediately if tasks available
+    if (result.wasSuccessful()) {
+
+      List<LockedExternalTaskDto> lockedTasks = result.tasks;
+      if (!lockedTasks.isEmpty() || dto.getAsyncResponseTimeout() == null) { // response immediately if tasks available
         asyncResponse.resume(lockedTasks);
       } else {
-        pendingRequests.add(incomingRequest);
-
-        if (pendingRequests.size() > 1) {
-          ArrayList<FetchAndLockRequest> temp = new ArrayList<FetchAndLockRequest>();
-          temp.addAll(pendingRequests);
-          Collections.sort(temp); // sort according to slack time by ascending order
-          pendingRequests.clear();
-          pendingRequests.addAll(temp);
-        }
-
-        handlerThread.interrupt();
+        addRequest(incomingRequest);
       }
     }
-  }
-
-  private void setAuthenticatedUser(ProcessEngine engine, String userId) {
-    List<String> groupIds = getGroupsOfUser(engine, userId);
-    List<String> tenantIds = getTenantsOfUser(engine, userId);
-
-    engine.getIdentityService().setAuthentication(userId, groupIds, tenantIds);
-  }
-
-  private List<String> getGroupsOfUser(ProcessEngine engine, String userId) {
-    List<Group> groups = engine.getIdentityService().createGroupQuery()
-      .groupMember(userId)
-      .list();
-
-    List<String> groupIds = new ArrayList<String>();
-    for (Group group : groups) {
-      groupIds.add(group.getId());
+    else {
+      handleProcessEngineException(incomingRequest, result.processEngineException);
     }
-    return groupIds;
-  }
 
-  private List<String> getTenantsOfUser(ProcessEngine engine, String userId) {
-    List<Tenant> tenants = engine.getIdentityService().createTenantQuery()
-      .userMember(userId)
-      .includingGroupsOfUser(true)
-      .list();
-
-    List<String> tenantIds = new ArrayList<String>();
-    for(Tenant tenant : tenants) {
-      tenantIds.add(tenant.getId());
-    }
-    return tenantIds;
-  }
-
-  private void clearAuthentication(ProcessEngine engine) {
-    engine.getIdentityService().clearAuthentication();
-  }
-
-  private AuthenticationResult extractAuthenticatedUser(ProcessEngine engine, String authHeader) {
-    if (authHeader != null && authHeader.startsWith(BASIC_AUTH_HEADER_PREFIX)) {
-      String encodedCredentials = authHeader.substring(BASIC_AUTH_HEADER_PREFIX.length());
-      String decodedCredentials = new String(Base64.decodeBase64(encodedCredentials));
-      int firstColonIndex = decodedCredentials.indexOf(":");
-
-      if (firstColonIndex == -1) {
-        return AuthenticationResult.unsuccessful();
-      } else {
-        String userName = decodedCredentials.substring(0, firstColonIndex);
-        String password = decodedCredentials.substring(firstColonIndex + 1);
-        if (isAuthenticated(engine, userName, password)) {
-          return AuthenticationResult.successful(userName);
-        } else {
-          return AuthenticationResult.unsuccessful(userName);
-        }
-      }
-    } else {
-      return AuthenticationResult.unsuccessful();
-    }
-  }
-
-  private boolean isAuthenticated(ProcessEngine engine, String userName, String password) {
-    return engine.getIdentityService().checkPassword(userName, password);
   }
 
   public Thread getHandlerThread() {
     return handlerThread;
   }
 
-  public void shutdown() {
-    isRunning = false;
-    handlerThread.interrupt();
-
-    for (FetchAndLockRequest pendingRequest: pendingRequests) {
-      invalidRequest(pendingRequest.getAsyncResponse(),
-        "Request rejected due to shutdown of application server.");
-    }
-  }
-
   public List<FetchAndLockRequest> getPendingRequests() {
     return pendingRequests;
+  }
+
+  public static class FetchAndLockResult {
+
+    List<LockedExternalTaskDto> tasks;
+    ProcessEngineException processEngineException;
+
+    public FetchAndLockResult(List<LockedExternalTaskDto> tasks) {
+      this.tasks = tasks;
+    }
+
+    public FetchAndLockResult(ProcessEngineException processEngineException) {
+      this.processEngineException = processEngineException;
+    }
+
+    public List<LockedExternalTaskDto> getTasks() {
+      return tasks;
+    }
+
+    public ProcessEngineException getProcessEngineException() {
+      return processEngineException;
+    }
+
+    public boolean wasSuccessful() {
+      return tasks != null && processEngineException == null;
+    }
+
+    public static FetchAndLockResult successful(List<LockedExternalTaskDto> tasks) {
+      return new FetchAndLockResult(tasks);
+    }
+
+    public static FetchAndLockResult failed(ProcessEngineException processEngineException) {
+      return new FetchAndLockResult(processEngineException);
+    }
   }
 
 }
